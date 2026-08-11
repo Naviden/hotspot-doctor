@@ -18,9 +18,11 @@ you're reading this on a connection that can't be trusted to download anything.
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 
@@ -463,6 +465,69 @@ def cmd_status(_args):
     return 0
 
 
+# ── intro ────────────────────────────────────────────────────────────────────
+# Tail flicks on even frames, blinks on the third. Trailing spaces are load
+# bearing: they wipe the previous frame's pixels as the cat moves right.
+CAT = (
+    (r" /\_/\ ", r"( o.o )", r"  > ^ <~"),
+    (r" /\_/\ ", r"( o.o )", r"  > ^ < "),
+    (r" /\_/\ ", r"( -.- )", r"  > ^ <~"),
+    (r" /\_/\ ", r"( o.o )", r"  > ^ < "),
+)
+TIPS = ("waking the cat", "sniffing the link", "chasing packets")
+
+
+def intro(done):
+    """Walk a cat toward the signal until `done` is set.
+
+    Cosmetic, but free: it runs while the first ping pair is in flight on
+    another thread, so it fills dead time `watch` already spent on a blank
+    screen. Skipped when stdout isn't a TTY, or when HOTSPOT_NO_CAT is set.
+    """
+    if not TTY or os.environ.get("HOTSPOT_NO_CAT"):
+        done.wait(8)
+        return
+
+    cols = min(shutil.get_terminal_size((80, 24)).columns, 64)
+    lane = max(6, cols - 22)
+    start = time.time()
+    # On a healthy link the warm-up pings return in ~50ms, so `done` alone
+    # would end the intro before a single frame drew. Give the cat its walk,
+    # but never hold the monitor hostage: hard ceiling at 8s.
+    floor, ceiling = 1.7, 8.0
+    try:
+        while True:
+            el = time.time() - start
+            if el >= ceiling or (done.is_set() and el >= floor):
+                break
+            x = min(lane, int(el * lane / 1.5))          # walk, then arrive
+            arrived = x >= lane
+            body = CAT[int(el * 8) % len(CAT)]
+            tip = TIPS[min(len(TIPS) - 1, int(el / 1.1))]
+
+            # signal bars light up left-to-right as the cat closes in
+            lit = min(4, int(el * 3)) if not arrived else 4
+            sig = "".join((cyan if i < lit else dim)("|") for i in range(4))
+
+            pad = " " * x
+            frame = [
+                "",
+                f"  {' ' * (lane + 9)}{sig}",
+                f"  {pad}{body[0]}",
+                f"  {pad}{body[1]}",
+                f"  {pad}{body[2]}",
+                "",
+                f"  {dim(tip + '…')}   ",
+            ]
+            sys.stdout.write("\033[H" + "\n".join(frame) + "\n")
+            sys.stdout.flush()
+            time.sleep(0.08)
+    finally:
+        if TTY:
+            sys.stdout.write("\033[2J")
+            sys.stdout.flush()
+
+
 # ── watch ────────────────────────────────────────────────────────────────────
 def cmd_watch(_args):
     info = link_info()
@@ -479,11 +544,37 @@ def cmd_watch(_args):
 
     if TTY:
         sys.stdout.write("\033[?25l\033[2J")  # hide cursor, clear
+
+    # Take the first sample pair on a thread so the intro overlaps the ~1-2.5s
+    # it costs, instead of adding to it. The first rendered frame then already
+    # has data in it.
+    done, first = threading.Event(), {}
+
+    def warm():
+        try:
+            first["gw"] = ping_once(info["gateway"], 1000)
+            first["net"] = ping_once(INTERNET, 1500)
+        finally:
+            done.set()
+
+    th = threading.Thread(target=warm, daemon=True)
+    th.start()
+    intro(done)
+    th.join(timeout=8)
+    if "gw" in first:
+        gw.add(first["gw"])
+    if "net" in first:
+        net.add(first["net"])
+    seeded = bool(first)
+
     try:
         while True:
             cycle = time.time()
-            gw.add(ping_once(info["gateway"], 1000))
-            net.add(ping_once(INTERNET, 1500))
+            if seeded:
+                seeded = False  # warm-up already filled this cycle's samples
+            else:
+                gw.add(ping_once(info["gateway"], 1000))
+                net.add(ping_once(INTERNET, 1500))
 
             now, cur = time.time(), counters(info["iface"])
             if cur and prev and now > prev_t:
@@ -531,7 +622,8 @@ def cmd_watch(_args):
                 sys.stdout.write("\033[J")
                 sys.stdout.flush()
             else:
-                print(lines[0])
+                # block-buffered when piped; flush or `watch > log` stays empty
+                print(lines[0], flush=True)
 
             time.sleep(max(0.0, 1.0 - (time.time() - cycle)))
     except KeyboardInterrupt:

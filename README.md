@@ -77,6 +77,8 @@ Requires macOS and Python 3.8+ (both already on your system — Python 3 ships w
 
 Running `hotspot` with no arguments is the same as `hotspot watch`.
 
+`watch` opens with a cat walking toward the signal. It runs while the first ping pair is in flight on another thread, so it fills startup time that used to be a blank screen rather than adding any. Set `HOTSPOT_NO_CAT=1` to skip it.
+
 ---
 
 ## Typical session
