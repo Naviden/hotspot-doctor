@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""
+hotspot — survival kit for working over an unstable iPhone Personal Hotspot.
+
+Pure stdlib. No pip install, nothing to download — which is the point, since
+you're reading this on a connection that can't be trusted to download anything.
+
+  hotspot              live monitor + keep-alive (same as `watch`)
+  hotspot watch        live monitor + keep-alive
+  hotspot status       one-shot snapshot
+  hotspot doctor       diagnose the link, recommend concrete fixes
+  hotspot calm         suspend background bandwidth hogs (reversible)
+  hotspot restore      resume everything `calm` suspended
+  hotspot keepalive    quiet keep-alive only, safe to background
+  hotspot dns fast     point DNS at 1.1.1.1 (carrier DNS is often the stall)
+  hotspot dns auto     hand DNS back to DHCP
+"""
+
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+
+STATE = os.path.expanduser("~/.cache/hotspot-suspended")
+INTERNET = "1.1.1.1"
+
+# ── tiny terminal helpers ────────────────────────────────────────────────────
+TTY = sys.stdout.isatty()
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+
+
+dim = lambda s: c("2", s)
+bold = lambda s: c("1", s)
+red = lambda s: c("31", s)
+green = lambda s: c("32", s)
+yellow = lambda s: c("33", s)
+cyan = lambda s: c("36", s)
+
+
+def run(cmd, timeout=6):
+    """Run a command, return stdout ('' on any failure). Never raises."""
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return p.stdout
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+# ── what the link actually is ────────────────────────────────────────────────
+def link_info():
+    """Default interface, gateway, MTU, hardware-port name, SSID."""
+    info = {"iface": None, "gateway": None, "mtu": None, "port": None, "ssid": None}
+
+    for line in run(["route", "-n", "get", "default"]).splitlines():
+        line = line.strip()
+        if line.startswith("interface:"):
+            info["iface"] = line.split(":", 1)[1].strip()
+        elif line.startswith("gateway:"):
+            info["gateway"] = line.split(":", 1)[1].strip()
+
+    if not info["iface"]:
+        return info
+
+    # hardware port name ("Wi-Fi", "iPhone USB", "Ethernet Adapter (en4)"...)
+    port = None
+    for block in run(["networksetup", "-listallhardwareports"]).split("\n\n"):
+        if f"Device: {info['iface']}" in block:
+            for line in block.splitlines():
+                if line.startswith("Hardware Port:"):
+                    port = line.split(":", 1)[1].strip()
+    info["port"] = port
+
+    m = re.search(rf"^{re.escape(info['iface'])}:.*?mtu (\d+)", run(["ifconfig", info["iface"]]), re.M)
+    if m:
+        info["mtu"] = int(m.group(1))
+
+    if port == "Wi-Fi":
+        out = run(["networksetup", "-getairportnetwork", info["iface"]])
+        if ":" in out:
+            info["ssid"] = out.split(":", 1)[1].strip()
+
+    return info
+
+
+def is_usb_tether(info):
+    return bool(info["port"]) and "iPhone" in info["port"]
+
+
+def is_hotspot(info):
+    """iPhone Personal Hotspot hands out 172.20.10.x."""
+    return bool(info["gateway"]) and info["gateway"].startswith("172.20.10.")
+
+
+# ── throughput from interface byte counters ──────────────────────────────────
+def counters(iface):
+    """(bytes_in, bytes_out) for iface, or None."""
+    for line in run(["netstat", "-ibn"]).splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[0] == iface and f[2].startswith("<Link"):
+            try:
+                return int(f[6]), int(f[9])
+            except ValueError:
+                return None
+    return None
+
+
+def human_rate(bytes_per_sec):
+    b = bytes_per_sec * 8.0
+    for unit in ("bps", "Kbps", "Mbps", "Gbps"):
+        if b < 1000:
+            return f"{b:5.1f} {unit}"
+        b /= 1000
+    return f"{b:5.1f} Tbps"
+
+
+# ── ping ─────────────────────────────────────────────────────────────────────
+def ping_once(host, wait_ms=1500):
+    """Round-trip ms, or None if lost."""
+    out = run(["ping", "-c", "1", "-n", "-W", str(wait_ms), host],
+              timeout=wait_ms / 1000.0 + 2)
+    m = re.search(r"time=([\d.]+) ms", out)
+    return float(m.group(1)) if m else None
+
+
+class Track:
+    """Rolling window of ping results for one target."""
+
+    def __init__(self, name, host, size=60):
+        self.name, self.host = name, host
+        self.samples = deque(maxlen=size)  # None == lost
+
+    def add(self, rtt):
+        self.samples.append(rtt)
+
+    @property
+    def alive(self):
+        return [s for s in self.samples if s is not None]
+
+    @property
+    def loss(self):
+        return 100.0 * sum(s is None for s in self.samples) / len(self.samples) if self.samples else 0.0
+
+    @property
+    def median(self):
+        a = sorted(self.alive)
+        return a[len(a) // 2] if a else None
+
+    @property
+    def jitter(self):
+        """Mean absolute change between consecutive successful pings."""
+        a = self.alive
+        if len(a) < 2:
+            return None
+        return sum(abs(a[i] - a[i - 1]) for i in range(1, len(a))) / (len(a) - 1)
+
+    @property
+    def dead(self):
+        return len(self.samples) >= 3 and not self.alive
+
+
+BARS = "▁▂▃▄▅▆▇█"
+STEPS = (20, 40, 60, 90, 130, 200, 300)
+
+
+def spark(samples, width):
+    out = []
+    for s in list(samples)[-width:]:
+        if s is None:
+            out.append(red("×"))
+            continue
+        level = sum(s > t for t in STEPS)
+        ch = BARS[level]
+        out.append(green(ch) if level <= 2 else yellow(ch) if level <= 4 else red(ch))
+    return "".join(out).rjust(width + 0)
+
+
+# ── verdict + diagnosis ──────────────────────────────────────────────────────
+def verdict(t):
+    if t.dead:
+        return "DOWN", red
+    if t.loss > 20:
+        return "BAD", red
+    med, jit = t.median, t.jitter
+    if t.loss > 5 or (med and med > 250) or (jit and jit > 80):
+        return "ROUGH", yellow
+    return "GOOD", green
+
+
+def diagnose(gw, net, info):
+    """The useful bit: is it the Wi-Fi hop to the phone, or the cellular side?"""
+    if not gw.samples or not net.samples:
+        return None
+    gw_ok = not gw.dead and gw.loss <= 10
+    net_ok = not net.dead and net.loss <= 10
+
+    if gw_ok and net_ok:
+        return green("Link healthy end to end.")
+    if not gw_ok:
+        fix = ("Move the Mac closer to the phone, or plug in the USB cable "
+               "(`hotspot doctor`).")
+        if is_usb_tether(info):
+            fix = "USB tether is dropping — reseat the cable, try another port."
+        return red("Problem is the hop to your phone, not the cellular side. ") + fix
+    return red("Phone link is fine — the cellular side is dropping. ") + (
+        "Move the phone toward a window and force LTE: Settings → Cellular → "
+        "Cellular Data Options → Voice & Data → LTE."
+    )
+
+
+# ── calm / restore ───────────────────────────────────────────────────────────
+# Reversible SIGSTOP. Deliberately excludes cloudd/photolibraryd — stopping
+# those wedges Finder and Photos.
+#
+# App entries are anchored to their .app bundle path, not a bare name: a plain
+# `pgrep -f "Google Drive"` also matches a browser tab or a shell command that
+# merely mentions it, and suspending those would be a nasty surprise.
+HOGS = [
+    ("bird", "iCloud Drive sync", True),
+    ("nsurlsessiond", "background downloads (App Store, iCloud)", True),
+    ("photoanalysisd", "Photos analysis", True),
+    ("mediaanalysisd", "Photos media analysis", True),
+    ("softwareupdated", "macOS software update", True),
+    ("/Dropbox[.]app/", "Dropbox", False),
+    ("/Google Drive[.]app/", "Google Drive", False),
+    ("/OneDrive[.]app/", "OneDrive", False),
+    ("/Creative Cloud[.]app/", "Adobe Creative Cloud", False),
+    ("/Adobe Desktop Service[.]app/", "Adobe background service", False),
+    ("/Spotify[.]app/", "Spotify", False),
+]
+
+
+def find_pids(name, exact):
+    flag = "-x" if exact else "-f"
+    out = run(["pgrep", flag, "-U", str(os.getuid()), name])
+    return [int(x) for x in out.split() if x.isdigit()]
+
+
+def ancestors():
+    """Our own pid and every parent up the tree — never signal these, or we'd
+    freeze the shell (and terminal) that invoked us."""
+    seen, pid = set(), os.getpid()
+    while pid and pid > 1 and pid not in seen:
+        seen.add(pid)
+        ppid = run(["ps", "-o", "ppid=", "-p", str(pid)]).strip()
+        pid = int(ppid) if ppid.isdigit() else 0
+    return seen
+
+
+def signal_hogs(sig):
+    """Send sig to every hog we can. Returns [(label, pid)] that took it."""
+    skip, hit = ancestors(), []
+    for name, label, exact in HOGS:
+        for pid in find_pids(name, exact):
+            if pid in skip:
+                continue
+            try:
+                os.kill(pid, sig)
+                hit.append((label, pid))
+            except (ProcessLookupError, PermissionError):
+                pass
+    return hit
+
+
+def cmd_calm(_args):
+    hit = signal_hogs(signal.SIGSTOP)
+    if not hit:
+        print("Nothing to suspend — no known bandwidth hogs running.")
+        return 0
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as fh:
+        for label, pid in hit:
+            fh.write(f"{pid}\t{label}\n")
+    print(bold(f"Suspended {len(hit)} process(es):"))
+    for label, pid in hit:
+        print(f"  {green('⏸')}  {label} {dim(f'(pid {pid})')}")
+    print()
+    print(dim("These are paused, not killed. Run `hotspot restore` when you're back"))
+    print(dim("on real wifi. iCloud Drive and Photos will not sync until you do."))
+    return 0
+
+
+def cmd_restore(_args):
+    hit = signal_hogs(signal.SIGCONT)
+    if os.path.exists(STATE):
+        os.remove(STATE)
+    print(bold(f"Resumed {len(hit)} process(es).") if hit else "Nothing was suspended.")
+    for label, pid in hit:
+        print(f"  {green('▶')}  {label} {dim(f'(pid {pid})')}")
+    return 0
+
+
+def suspended_count():
+    try:
+        with open(STATE) as fh:
+            return sum(1 for line in fh if line.strip())
+    except OSError:
+        return 0
+
+
+# ── dns ──────────────────────────────────────────────────────────────────────
+def cmd_dns(args):
+    mode = args[0] if args else ""
+    if mode not in ("fast", "auto"):
+        print("usage: hotspot dns fast|auto")
+        return 2
+    info = link_info()
+    port = info["port"]
+    if not port:
+        print(red("Could not determine the active network service."))
+        return 1
+    servers = ["1.1.1.1", "1.0.0.1"] if mode == "fast" else ["Empty"]
+    cmd = ["networksetup", "-setdnsservers", port] + servers
+    p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if p.returncode == 0:
+        print(green(f"DNS for {port} → ") + (", ".join(servers) if mode == "fast" else "DHCP default"))
+        return 0
+    print(red("Needs admin rights. Run:"))
+    print("  sudo " + " ".join(f'"{a}"' if " " in a else a for a in cmd))
+    return 1
+
+
+# ── doctor ───────────────────────────────────────────────────────────────────
+def cmd_doctor(_args):
+    info = link_info()
+    print(bold("Link"))
+    if not info["iface"]:
+        print(red("  No default route — you are offline."))
+        return 1
+    label = info["port"] or info["iface"]
+    if info["ssid"]:
+        label += f" · {info['ssid']}"
+    print(f"  interface  {cyan(info['iface'])}  ({label})")
+    print(f"  gateway    {info['gateway']}")
+    print(f"  mtu        {info['mtu']}")
+    print()
+
+    findings = []
+
+    if is_hotspot(info) and not is_usb_tether(info):
+        findings.append((
+            "high",
+            "You are tethering over Wi-Fi.",
+            "Plug the iPhone into the Mac with a cable. USB tethering removes the "
+            "Wi-Fi hop entirely — no interference, no hotspot sleep, lower latency, "
+            "and the phone charges. This is the single biggest win available to you.",
+        ))
+        findings.append((
+            "med",
+            "If you must stay on Wi-Fi, turn on Maximize Compatibility.",
+            "iPhone → Settings → Personal Hotspot → Maximize Compatibility. Forces "
+            "2.4 GHz: lower ceiling, much better range and stability.",
+        ))
+
+    if is_hotspot(info):
+        findings.append((
+            "med",
+            "Force LTE instead of 5G.",
+            "Settings → Cellular → Cellular Data Options → Voice & Data → LTE. At "
+            "the edge of coverage, 5G NSA flaps between bands constantly; LTE is "
+            "slower on paper and far steadier in practice.",
+        ))
+
+    if info["mtu"] and info["mtu"] > 1420 and is_hotspot(info):
+        findings.append((
+            "low",
+            f"MTU is {info['mtu']}.",
+            "Tethered links sometimes silently drop full-size packets, which looks "
+            "like random stalls. If you see big transfers hang while pings stay "
+            f"clean, try: sudo ifconfig {info['iface']} mtu 1400",
+        ))
+
+    running = [(label_, name) for name, label_, exact in HOGS if find_pids(name, exact)]
+    if running:
+        findings.append((
+            "high",
+            f"{len(running)} background sync process(es) running: "
+            + ", ".join(sorted({l for l, _ in running})) + ".",
+            "These will happily eat your entire tether. Run `hotspot calm` to pause "
+            "them, `hotspot restore` when you're back on real wifi.",
+        ))
+
+    findings.append((
+        "med",
+        "Enable Low Data Mode for this network.",
+        "System Settings → Wi-Fi → (i) next to the hotspot → Low Data Mode. Stops "
+        "macOS itself from doing background fetches and updates over the tether.",
+    ))
+
+    t0 = time.time()
+    dns_ok = ping_once(INTERNET) is not None
+    resolve_ms = None
+    if dns_ok:
+        t1 = time.time()
+        run(["dscacheutil", "-q", "host", "-a", "name", "apple.com"], timeout=8)
+        resolve_ms = (time.time() - t1) * 1000
+        if resolve_ms > 400:
+            findings.append((
+                "med",
+                f"DNS resolution took {resolve_ms:.0f} ms.",
+                "Carrier DNS over a tether is often the real source of 'everything "
+                "feels stuck'. Run `hotspot dns fast` to use 1.1.1.1.",
+            ))
+
+    print(bold("Findings"))
+    order = {"high": 0, "med": 1, "low": 2}
+    tag = {"high": red("●"), "med": yellow("●"), "low": dim("●")}
+    for sev, title, fix in sorted(findings, key=lambda f: order[f[0]]):
+        print(f"  {tag[sev]} {bold(title)}")
+        for line in wrap(fix, 74):
+            print(f"      {dim(line)}")
+        print()
+    if not findings:
+        print(green("  Nothing to flag."))
+    return 0
+
+
+def wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = f"{line} {w}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+# ── status ───────────────────────────────────────────────────────────────────
+def cmd_status(_args):
+    info = link_info()
+    if not info["iface"]:
+        print(red("Offline — no default route."))
+        return 1
+    label = info["port"] or info["iface"]
+    kind = "USB tether" if is_usb_tether(info) else (
+        "Wi-Fi hotspot" if is_hotspot(info) else "network")
+    print(f"{bold(label)} {dim('·')} {kind} {dim('·')} gw {info['gateway']}")
+
+    gw = Track("phone", info["gateway"])
+    net = Track("internet", INTERNET)
+    for _ in range(5):
+        gw.add(ping_once(info["gateway"], 1000))
+        net.add(ping_once(INTERNET, 1500))
+    for t in (gw, net):
+        v, col = verdict(t)
+        med = f"{t.median:.0f} ms" if t.median else "—"
+        print(f"  {t.name:<9} {col(v):<16} {med:>8}  loss {t.loss:.0f}%")
+    d = diagnose(gw, net, info)
+    if d:
+        print()
+        for line in wrap(re.sub(r"\033\[\d+m", "", d), 74):
+            print(f"  {line}")
+    return 0
+
+
+# ── watch ────────────────────────────────────────────────────────────────────
+def cmd_watch(_args):
+    info = link_info()
+    if not info["iface"]:
+        print(red("Offline — no default route."))
+        return 1
+
+    gw = Track("phone", info["gateway"])
+    net = Track("internet", INTERNET)
+    prev, prev_t = counters(info["iface"]), time.time()
+    rin = rout = 0.0
+    width = 46
+    started = time.time()
+
+    if TTY:
+        sys.stdout.write("\033[?25l\033[2J")  # hide cursor, clear
+    try:
+        while True:
+            cycle = time.time()
+            gw.add(ping_once(info["gateway"], 1000))
+            net.add(ping_once(INTERNET, 1500))
+
+            now, cur = time.time(), counters(info["iface"])
+            if cur and prev and now > prev_t:
+                dt = now - prev_t
+                rin = max(0, cur[0] - prev[0]) / dt
+                rout = max(0, cur[1] - prev[1]) / dt
+            prev, prev_t = cur, now
+
+            lines = []
+            label = info["port"] or info["iface"]
+            kind = "USB tether" if is_usb_tether(info) else (
+                "Wi-Fi hotspot" if is_hotspot(info) else "network")
+            susp = suspended_count()
+            head = f"{bold('hotspot')}  {label} · {kind} · gw {info['gateway']}"
+            if susp:
+                head += dim(f"  [{susp} paused]")
+            lines += [head, ""]
+
+            for t in (gw, net):
+                v, col = verdict(t)
+                med = f"{t.median:.0f}ms" if t.median else "—"
+                jit = f"{t.jitter:.0f}ms" if t.jitter else "—"
+                lines.append(
+                    f"  {t.name:<9} {spark(t.samples, width)}  {col(v.ljust(5))}"
+                )
+                lines.append(
+                    dim(f"  {'':<9} median {med:>7}   jitter {jit:>7}   "
+                        f"loss {t.loss:>3.0f}%   {t.host}")
+                )
+                lines.append("")
+
+            lines.append(f"  {'traffic':<9} ↓ {human_rate(rin)}   ↑ {human_rate(rout)}")
+            lines.append("")
+            d = diagnose(gw, net, info)
+            if d:
+                for line in wrap(re.sub(r"\033\[\d+m", "", d), 70):
+                    lines.append(f"  {line}")
+            lines.append("")
+            lines.append(dim(f"  keep-alive active · {int(time.time() - started)}s · ctrl-c to stop"))
+
+            if TTY:
+                sys.stdout.write("\033[H")
+                for line in lines:
+                    sys.stdout.write("\033[2K" + line + "\n")
+                sys.stdout.write("\033[J")
+                sys.stdout.flush()
+            else:
+                print(lines[0])
+
+            time.sleep(max(0.0, 1.0 - (time.time() - cycle)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if TTY:
+            sys.stdout.write("\033[?25h\n")
+            sys.stdout.flush()
+    return 0
+
+
+# ── keepalive ────────────────────────────────────────────────────────────────
+def cmd_keepalive(args):
+    """Quiet trickle so the link never sits idle long enough to be torn down."""
+    every = int(args[0]) if args and args[0].isdigit() else 15
+    info = link_info()
+    target = info["gateway"] or INTERNET
+    print(dim(f"keep-alive → {target} every {every}s (ctrl-c to stop)"))
+    try:
+        while True:
+            ping_once(target, 1000)
+            ping_once(INTERNET, 1500)
+            time.sleep(every)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+COMMANDS = {
+    "watch": cmd_watch,
+    "status": cmd_status,
+    "doctor": cmd_doctor,
+    "calm": cmd_calm,
+    "restore": cmd_restore,
+    "keepalive": cmd_keepalive,
+    "dns": cmd_dns,
+}
+
+
+def main(argv):
+    if sys.platform != "darwin":
+        print("hotspot is macOS-only.", file=sys.stderr)
+        return 1
+    cmd = argv[0] if argv else "watch"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        print(f"unknown command: {cmd}\n", file=sys.stderr)
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
