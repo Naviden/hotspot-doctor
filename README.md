@@ -1,6 +1,17 @@
-# hotspot-doctor
+<p align="center">
+  <img src="logo.png" alt="Hotspot Doctor" width="200">
+</p>
 
-**Survive working over an unstable iPhone Personal Hotspot.**
+<p align="center">
+  <b>Survive working over an unstable iPhone Personal Hotspot.</b>
+</p>
+
+<p align="center">
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-111?logo=apple&logoColor=fff">
+  <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=fff">
+  <img alt="dependencies: none" src="https://img.shields.io/badge/dependencies-none-2ea44f">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
 
 A single-file macOS CLI that tells you *why* your tether is bad — not just that it is — and pauses the background processes quietly eating it.
 
