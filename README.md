@@ -150,6 +150,14 @@ Ranked, for when you're at the edge of coverage:
 
 ---
 
+## Credits
+
+Built by [Naviden](https://github.com/Naviden) with help from [Claude](https://claude.ai), via [Claude Code](https://claude.com/claude-code).
+
+It began as a different question — *"can you build an iPhone app to make my hotspot better?"* — and turned into this once it was clear that an iOS app cannot reach any of the machinery that matters. See [What this can't do](#what-this-cant-do).
+
+---
+
 ## License
 
 MIT
