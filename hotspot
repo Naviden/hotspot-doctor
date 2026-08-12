@@ -14,6 +14,8 @@ you're reading this on a connection that can't be trusted to download anything.
   hotspot restore      resume everything `calm` suspended
   hotspot keepalive    quiet keep-alive only, safe to background
   hotspot mtu          find the real path MTU (why big transfers stall)
+  hotspot wifi         list nearby networks, ranked by encryption
+  hotspot trust        check if this network tampers with DNS/HTTPS/traffic
   hotspot dns fast     point DNS at 1.1.1.1 (carrier DNS is often the stall)
   hotspot dns auto     hand DNS back to DHCP
 """
@@ -22,10 +24,13 @@ import os
 import re
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 
@@ -258,6 +263,101 @@ def wifi_info():
     return d
 
 
+# ── nearby networks ──────────────────────────────────────────────────────────
+# What a passive scan can and cannot tell you, stated once so the rest of the
+# code doesn't have to pretend otherwise:
+#   CAN  — encryption in use, signal, band, channel
+#   CANNOT — who runs the access point, whether the operator is trustworthy,
+#            or whether an SSID is an impostor. BSSIDs aren't exposed here, so
+#            evil-twin detection is impossible. Encryption is not safety.
+# Hence: rank risk, never certify "safe". `hotspot trust` is where the real
+# answers live, because they require actually being on the network.
+SEC_RANK = {
+    "none":               (0, "OPEN"),
+    "wep":                (0, "WEP (broken)"),
+    "wpa personal":       (2, "WPA (obsolete)"),
+    "wpa2 personal":      (3, "WPA2"),
+    "wpa2/wpa3 personal": (4, "WPA2/WPA3"),
+    "wpa3 personal":      (5, "WPA3"),
+    "wpa2 enterprise":    (4, "WPA2 Enterprise"),
+    "wpa3 enterprise":    (5, "WPA3 Enterprise"),
+}
+
+
+def wifi_scan():
+    """Nearby networks. Returns (list, names_hidden).
+
+    macOS 26 redacts SSIDs from processes without Location Services access,
+    so the caller must be able to tell "no names" from "no networks".
+    """
+    out = run(["system_profiler", "SPAirPortDataType"], timeout=30)
+    _, _, rest = out.partition("Other Local Wi-Fi Networks:")
+    if not rest:
+        return [], False
+    rest = re.split(r"\n {8}[a-z]", rest)[0]  # ends at the next interface block
+    nets, cur = [], None
+    for line in rest.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 12 and s.endswith(":") and ": " not in s:
+            cur = {"ssid": s[:-1]}
+            nets.append(cur)
+        elif cur is not None and ": " in s:
+            k, _, v = s.partition(": ")
+            cur[k.strip()] = v.strip()
+    hidden = any(n["ssid"] == "<redacted>" for n in nets)
+    return nets, hidden
+
+
+def net_rank(n):
+    """(security score, label, rssi) for one scanned network."""
+    sec = n.get("Security", "").lower()
+    score, label = SEC_RANK.get(sec, (1, n.get("Security") or "unknown"))
+    m = re.match(r"(-?\d+)\s*dBm", n.get("Signal / Noise", ""))
+    return score, label, (int(m.group(1)) if m else None)
+
+
+def cmd_wifi(_args):
+    nets, hidden = wifi_scan()
+    if not nets:
+        print(yellow("No other networks visible."))
+        print(dim("  macOS may also be withholding the scan entirely — see "
+                  "Location Services below."))
+    else:
+        print(f"{bold('nearby networks')}  {dim(f'({len(nets)} visible)')}\n")
+        print(dim(f"  {'name':<20} {'encryption':<18} {'signal':<9} band"))
+        rows = sorted(nets, key=lambda n: (net_rank(n)[0], net_rank(n)[2] or -999),
+                      reverse=True)
+        for n in rows:
+            score, label, rssi = net_rank(n)
+            ch = n.get("Channel", "")
+            band = "5GHz" if "5GHz" in ch else "2.4GHz" if "2GHz" in ch else "?"
+            _word, wcol = signal_words(rssi, None)
+            sig = f"{rssi} dBm" if rssi is not None else "—"
+            seccol = red if score == 0 else yellow if score <= 2 else green
+            # Pad before colouring: escape codes have width 0 but len() > 0.
+            name, lab, sg = n["ssid"][:19].ljust(20), label.ljust(18), sig.ljust(9)
+            print(f"  {name} {seccol(lab)} {(wcol or dim)(sg)} {dim(band)}")
+        print()
+
+    if hidden:
+        print(yellow("  Network names are hidden."))
+        for line in wrap("macOS only reveals SSIDs to apps with Location "
+                         "Services permission. Grant it to your terminal in "
+                         "System Settings → Privacy & Security → Location "
+                         "Services, then run this again.", 72):
+            print(f"  {line}")
+        print()
+
+    print(dim("  Encryption is not safety. This tells you how traffic is"))
+    print(dim("  protected in the air — not who runs the access point, nor"))
+    print(dim("  whether an SSID is genuine. Once connected, `hotspot trust`"))
+    print(dim("  checks whether the network is actually tampering with you."))
+    return 0
+
+
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
@@ -347,6 +447,92 @@ def signal_words(rssi, snr):
     if rssi >= -78:
         return "weak", yellow
     return "very weak", red
+
+
+# ── is this network tampering with me? ───────────────────────────────────────
+# These are the checks a scan cannot make. They all require being on the
+# network, and each one tests a specific, falsifiable claim rather than
+# producing a vibe.
+
+# Deliberately not exhaustive — an unfamiliar issuer is a prompt to look, not
+# proof of attack. Any corporate MITM whose root is installed in the system
+# store will still validate; only the issuer name gives it away.
+PUBLIC_CAS = (
+    "digicert", "let's encrypt", "isrg", "google trust services", "sectigo",
+    "globalsign", "amazon", "microsoft", "apple", "entrust", "godaddy",
+    "cloudflare", "comodo", "baltimore", "verisign", "thawte", "geotrust",
+    "starfield", "identrust", "buypass", "actalis", "certum", "zerossl",
+)
+
+
+def check_captive_portal(timeout=8):
+    """Apple's own portal probe. Returns None if clean, else what came back."""
+    url = "http://captive.apple.com/hotspot-detect.html"
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "CaptiveNetworkSupport/1.0 wispr"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(4096).decode("utf-8", "replace")
+            final = r.geturl()
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code} instead of the expected page"
+    except Exception as e:
+        return f"unreachable ({type(e).__name__})"
+    if "Success" in body:
+        return None
+    if final != url:
+        return f"redirected to {final[:60]}"
+    return "the response was altered"
+
+
+def check_dns(timeout=6):
+    """Two falsifiable DNS claims. Returns a list of problems (empty == clean).
+
+    1. A name that cannot exist must not resolve. RFC 2606 reserves .invalid,
+       and a random label under .com covers resolvers that special-case it.
+    2. A name with a famously fixed address must resolve to that address.
+    """
+    problems = []
+    rand = os.urandom(8).hex()
+    for host in (f"{rand}.invalid", f"nx-{rand}.com"):
+        try:
+            addrs = socket.getaddrinfo(host, None, socket.AF_INET)
+            ip = addrs[0][4][0] if addrs else "?"
+            problems.append(
+                f"made-up name {host[:22]}… resolved to {ip} — this resolver "
+                f"hijacks failed lookups, usually to inject ads")
+            break  # one demonstration is enough
+        except socket.gaierror:
+            pass
+        except Exception:
+            pass
+    try:
+        addrs = {a[4][0] for a in socket.getaddrinfo("one.one.one.one", None,
+                                                     socket.AF_INET)}
+        if addrs and not (addrs & {"1.1.1.1", "1.0.0.1"}):
+            problems.append(
+                f"one.one.one.one resolved to {sorted(addrs)[0]} instead of "
+                f"1.1.1.1 — DNS answers are being rewritten")
+    except Exception:
+        pass
+    return problems
+
+
+def check_tls(host="cloudflare.com", timeout=8):
+    """Returns (ok, issuer, detail). ok=False means look closely."""
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                cert = ss.getpeercert()
+    except ssl.SSLCertVerificationError as e:
+        return False, None, f"certificate did not verify — {e.verify_message}"
+    except Exception as e:
+        return None, None, f"couldn't check ({type(e).__name__})"
+    issuer = dict(x[0] for x in cert.get("issuer", ()))
+    org = issuer.get("organizationName") or issuer.get("commonName") or "unknown"
+    known = any(ca in org.lower() for ca in PUBLIC_CAS)
+    return known, org, None
 
 
 # ── path MTU ─────────────────────────────────────────────────────────────────
@@ -1131,6 +1317,95 @@ def cmd_mtu(args):
     return 0
 
 
+# ── trust ────────────────────────────────────────────────────────────────────
+def cmd_trust(_args):
+    info = link_info()
+    if not info["iface"]:
+        print(red("Offline — no default route."))
+        return 1
+
+    note = dim("checking what this network does to your traffic …")
+    print(f"{bold('hotspot trust')}  {note}\n")
+    box = {}
+    threads = [
+        threading.Thread(target=lambda: box.update(portal=check_captive_portal()),
+                         daemon=True),
+        threading.Thread(target=lambda: box.update(dns=check_dns()), daemon=True),
+        threading.Thread(target=lambda: box.update(tls=check_tls()), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    bad = 0
+    portal = box.get("portal", "check did not finish")
+    if portal is None:
+        print(f"  {green('ok')}    captive portal   none — traffic reaches the "
+              f"internet unmodified")
+    else:
+        bad += 1
+        print(f"  {yellow('!!')}    captive portal   {portal}")
+
+    dns_problems = box.get("dns")
+    if dns_problems == []:
+        print(f"  {green('ok')}    DNS              answers are not being rewritten")
+    elif dns_problems is None:
+        print(f"  {dim('--')}    DNS              check did not finish")
+    else:
+        bad += len(dns_problems)
+        for p in dns_problems:
+            head, *tail = wrap(p, 54)
+            print(f"  {red('XX')}    DNS              {head}")
+            for line in tail:
+                print(f"                         {line}")
+
+    tls = box.get("tls")
+    if tls is None:
+        print(f"  {dim('--')}    TLS              check did not finish")
+    else:
+        ok, org, detail = tls
+        if ok is None:
+            print(f"  {dim('--')}    TLS              {detail}")
+        elif ok is False and detail:
+            bad += 1
+            print(f"  {red('XX')}    TLS              {detail}")
+        elif ok is False:
+            bad += 1
+            print(f"  {red('XX')}    TLS              cloudflare.com is being "
+                  f"served by “{org}”")
+        else:
+            print(f"  {green('ok')}    TLS              cloudflare.com served by "
+                  f"{org} {dim('(a public CA)')}")
+    print()
+
+    if bad == 0:
+        print(green("  Nothing is intercepting your traffic."))
+    else:
+        print(red("  This network is modifying your traffic."))
+        if tls and tls[0] is False:
+            for line in wrap("An unexpected certificate issuer means your HTTPS "
+                             "is being decrypted and re-signed. Whoever runs "
+                             "this network can read everything, including "
+                             "passwords. Do not sign in to anything here.", 72):
+                print(f"  {line}")
+        elif portal is not None:
+            for line in wrap("A captive portal intercepts traffic until you "
+                             "accept its terms. That is normal for cafés and "
+                             "hotels, but the portal page itself is a common "
+                             "phishing surface — never enter a password you use "
+                             "elsewhere.", 72):
+                print(f"  {line}")
+    print()
+    for line in wrap("These checks prove specific things: that DNS answers are "
+                     "intact, that HTTPS is not being re-signed, that traffic "
+                     "is not redirected. A clean result does not mean the "
+                     "operator is trustworthy — only that they are not doing "
+                     "these particular things right now.", 72):
+        print(dim(f"  {line}"))
+    return 0 if bad == 0 else 1
+
+
 # ── keepalive ────────────────────────────────────────────────────────────────
 def cmd_keepalive(args):
     """Quiet trickle so the link never sits idle long enough to be torn down."""
@@ -1158,6 +1433,8 @@ COMMANDS = {
     "keepalive": cmd_keepalive,
     "dns": cmd_dns,
     "mtu": cmd_mtu,
+    "wifi": cmd_wifi,
+    "trust": cmd_trust,
 }
 
 

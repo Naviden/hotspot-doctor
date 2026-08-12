@@ -81,6 +81,38 @@ Three notes on cost and privacy, since this is the one command that reaches outs
 
 ---
 
+## Picking a network, and checking what it does to you
+
+`hotspot wifi` lists what's nearby, ranked by encryption, with open and WEP networks flagged in red.
+
+But a passive scan cannot tell you a network is **safe** — only that it is **encrypted**, and those are different claims. WPA3 says nothing about who runs the access point or whether the login page you're about to see is genuine. macOS also doesn't expose BSSIDs to this API, so evil-twin detection is impossible here. This tool ranks risk; it never certifies safety.
+
+The answerable question is *what is this network actually doing to my traffic*, and that needs you to be on it:
+
+```
+$ hotspot trust
+  ok    captive portal   none — traffic reaches the internet unmodified
+  ok    DNS              answers are not being rewritten
+  XX    TLS              cloudflare.com is being served by “Acme Corp SSL Inspection”
+
+  This network is modifying your traffic.
+  An unexpected certificate issuer means your HTTPS is being decrypted and
+  re-signed. Whoever runs this network can read everything, including
+  passwords. Do not sign in to anything here.
+```
+
+Three falsifiable checks:
+
+- **Captive portal** — request a known endpoint and see whether the answer came back intact.
+- **DNS** — a name that cannot exist must not resolve (a resolver that answers anyway is hijacking failed lookups), and a name with a famously fixed address must return that address.
+- **TLS** — pull the certificate chain for a known host and check the issuer is a public CA. This is what catches corporate and hostile interception, and almost nothing consumer-grade checks it.
+
+A clean result means those specific things are not happening right now. It does not mean the operator is trustworthy, and the tool says so every time rather than letting a green row imply more than it proves.
+
+**On SSIDs being hidden:** macOS only reveals network names to apps holding Location Services permission. Without it you'll get a list of `<redacted>` — grant it to your terminal in System Settings → Privacy & Security → Location Services. `hotspot wifi` detects the redaction and tells you, instead of showing an empty-looking list.
+
+---
+
 ## The failure nobody checks for
 
 Ping packets are tiny. So a link that silently drops *full-size* packets still measures as flawless — 0% loss, low jitter, green across the board — while every real transfer stalls. SSH freezes mid-session. Pages load halfway. `git clone` hangs at 99%. Every tool tells you the connection is fine, because by the only thing they measure, it is.
@@ -135,6 +167,8 @@ Requires macOS and Python 3.8+ (both already on your system — Python 3 ships w
 | `hotspot doctor` | Diagnose the link and print concrete, ranked fixes |
 | `hotspot status` | One-shot snapshot, good for scripts |
 | `hotspot mtu` | Find the real path MTU — why big transfers stall while ping looks fine |
+| `hotspot wifi` | List nearby networks, ranked by encryption |
+| `hotspot trust` | Check whether the network you're on tampers with DNS, HTTPS or traffic |
 | `hotspot calm` | Suspend background bandwidth hogs (**reversible**) |
 | `hotspot restore` | Resume everything `calm` suspended |
 | `hotspot keepalive [secs]` | Quiet keep-alive only, safe to background |
