@@ -20,17 +20,17 @@ Zero dependencies. Pure Python 3 standard library, on purpose: a tool for a bad 
 ```
 hotspot  Wi-Fi · Wi-Fi hotspot · gw 172.20.10.1
 
-  phone     ▁▁▁▁▁▁▁▂▁▁▁▁  GOOD
-            median     4ms   jitter     3ms   loss   0%   172.20.10.1
+  phone     ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  GOOD
+            median       4ms   jitter       1ms   loss   0%   172.20.10.1
 
-  internet  ▃▃▄▃▃×▅▃▄▃▃▃  ROUGH
-            median    42ms   jitter    31ms   loss   8%   1.1.1.1
+  internet  ▁▁▁▁▄▁▁×▁▁▁▅▁▁▁▁▁×▁▁▁▁▁▄▁▁▁▁▁▁▁▁▁×▁▁▁▁▁▁▁▁▁▁▁▁  ROUGH
+            median      41ms   jitter      14ms   loss   7%   1.1.1.1
 
   traffic   ↓  10.0 Kbps   ↑   8.7 Kbps
 
-  Phone link is fine — the cellular side is dropping. Move the phone toward
-  a window and force LTE: Settings → Cellular → Cellular Data Options →
-  Voice & Data → LTE.
+  Your phone link is fine — the cellular side is dropping.
+    → move the phone toward a window
+    → force LTE: Settings → Cellular → Cellular Data Options
 
   keep-alive active · 7s · ctrl-c to stop
 ```

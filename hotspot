@@ -207,13 +207,22 @@ def spark(samples, width, baseline=None):
 
 
 # ── verdict + diagnosis ──────────────────────────────────────────────────────
+# One set of thresholds for both the badge and the summary. They used to carry
+# their own: verdict() called 6% loss ROUGH while diagnose() only reacted above
+# 10%, so the badge said ROUGH and the line under it said "nothing to do".
+LOSS_ROUGH, LOSS_BAD = 5.0, 20.0
+JITTER_ROUGH = 50.0
+MEDIAN_ROUGH = 250.0
+
+
 def verdict(t):
     if t.dead:
         return "DOWN", red
-    if t.loss > 20:
+    if t.loss > LOSS_BAD:
         return "BAD", red
     med, jit = t.median, t.jitter
-    if t.loss > 5 or (med and med > 250) or (jit and jit > 80):
+    if (t.loss > LOSS_ROUGH or (med and med > MEDIAN_ROUGH)
+            or (jit and jit > JITTER_ROUGH)):
         return "ROUGH", yellow
     return "GOOD", green
 
@@ -408,8 +417,8 @@ def diagnose(gw, net, info, mtu_bad=None, busy=False, paused=0):
     """
     if not gw.samples or not net.samples:
         return None
-    gw_ok = not gw.dead and gw.loss <= 10
-    net_ok = not net.dead and net.loss <= 10
+    gw_ok = not gw.dead and gw.loss <= LOSS_ROUGH
+    net_ok = not net.dead and net.loss <= LOSS_ROUGH
 
     if gw.dead and net.dead:
         return red, "Link is down.", [
@@ -430,17 +439,25 @@ def diagnose(gw, net, info, mtu_bad=None, busy=False, paused=0):
     if not net_ok:
         return red, "Your phone link is fine — the cellular side is dropping.", [
             "move the phone toward a window",
-            "force LTE: Settings → Cellular → Cellular Data Options → Voice & Data",
+            "force LTE: Settings → Cellular → Cellular Data Options",
         ]
 
     # Everything passes the loss test. Now the things that still ruin the day.
-    jit = net.jitter or 0
-    if jit > 50:
+    jit, med = net.jitter or 0, net.median or 0
+    if jit > JITTER_ROUGH:
         acts = ["expect SSH and calls to stutter; large pages will feel slow"]
         if not paused:
             acts.append("hotspot calm — pause background sync, which makes jitter worse")
         acts.append("move the phone toward a window")
         return yellow, f"Latency is OK but unstable ({jit:.0f}ms jitter).", acts
+
+    # Slow but steady is its own state, and the badge already calls it ROUGH —
+    # so there has to be a branch for it or the two disagree again.
+    if med > MEDIAN_ROUGH:
+        return yellow, f"Everything is slow but steady ({med:.0f}ms).", [
+            "you are far from the tower — move the phone toward a window",
+            "force LTE: Settings → Cellular → Cellular Data Options",
+        ]
 
     if mtu_bad:
         # Pings are small, so a path dropping full-size packets measures as
