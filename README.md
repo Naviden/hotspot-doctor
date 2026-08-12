@@ -74,7 +74,8 @@ It only tells you things that are still true: recommendations you've already app
 
 Three notes on cost and privacy, since this is the one command that reaches outside your machine:
 
-- The carrier lookup is **one DNS query and one whois** — a few KB, no API key, no HTTP geolocation service.
+- The carrier lookup is **one DNS query and one whois** — a few KB, no API key, no HTTP geolocation service. Guest and corporate networks often block DNS to outside resolvers, so it falls back to a single small HTTPS request to `cloudflare.com/cdn-cgi/trace` for the address.
+- Recommendations are suppressed once they no longer apply, including the reverse case: leave a hotspot with a lowered MTU and `doctor` will tell you to restore it, because `ifconfig` MTU survives a network switch.
 - The speed test downloads **at most 2 MB, capped at 6 seconds**, from Cloudflare. On a metered tether that is not nothing, so `hotspot doctor --no-speed` skips it.
 - Everything else in the tool is entirely local.
 

@@ -55,12 +55,15 @@ def run(cmd, timeout=6, merge=False):
     matter to MTU probing ('Message too long').
     """
     try:
-        p = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
-        )
-        return p.stdout + p.stderr if merge else p.stdout
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     except (subprocess.SubprocessError, OSError):
         return ""
+    # Decode by hand rather than text=True: whois servers serve latin-1 and
+    # other legacy encodings, and text=True raises UnicodeDecodeError from
+    # inside subprocess before we ever see the bytes.
+    def dec(b):
+        return (b or b"").decode("utf-8", "replace")
+    return dec(p.stdout) + dec(p.stderr) if merge else dec(p.stdout)
 
 
 # ── what the link actually is ────────────────────────────────────────────────
@@ -255,16 +258,40 @@ def wifi_info():
     return d
 
 
+IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def public_ip():
+    """Your address as the internet sees it.
+
+    DNS first because it's the cheapest, then HTTPS: guest and corporate
+    networks routinely block port 53 to outside resolvers, which silently
+    killed this lookup on exactly the sort of network people run doctor on.
+    """
+    ip = run(["dig", "+short", "+time=3", "+tries=1",
+              "myip.opendns.com", "@resolver1.opendns.com"], timeout=10)
+    ip = ip.strip().split("\n")[0].strip()
+    if IPV4_RE.match(ip):
+        return ip
+    try:
+        req = urllib.request.Request("https://cloudflare.com/cdn-cgi/trace",
+                                     headers={"User-Agent": "hotspot-doctor"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            body = r.read(2048).decode("utf-8", "replace")
+        m = re.search(r"^ip=(\d{1,3}(?:\.\d{1,3}){3})$", body, re.M)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
 def carrier_info():
     """Which network you're actually egressing through, via DNS + whois.
 
     Deliberately not an HTTP geolocation API: one DNS query plus one whois is
     a few KB, needs no key, and sends nothing but the lookup itself.
     """
-    ip = run(["dig", "+short", "+time=3", "+tries=1",
-              "myip.opendns.com", "@resolver1.opendns.com"], timeout=10)
-    ip = ip.strip().split("\n")[0].strip()
-    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+    ip = public_ip()
+    if not ip:
         return {}
     d = {"ip": ip}
     w = run(["whois", ip], timeout=15)
@@ -606,8 +633,19 @@ def cmd_doctor(args):
     # Both are passive and slow-ish (system_profiler and whois each take a few
     # seconds). Overlap them so the header costs one wait, not two.
     box = {}
-    threads = [threading.Thread(target=lambda: box.update(wifi=wifi_info()), daemon=True),
-               threading.Thread(target=lambda: box.update(car=carrier_info()), daemon=True)]
+
+    def guarded(fn, key):
+        """Neither lookup is load-bearing. A failure should cost you that one
+        line, not derail the report with a traceback through the middle of it."""
+        def inner():
+            try:
+                box[key] = fn()
+            except Exception:
+                box[key] = {}
+        return inner
+
+    threads = [threading.Thread(target=guarded(wifi_info, "wifi"), daemon=True),
+               threading.Thread(target=guarded(carrier_info, "car"), daemon=True)]
     for t in threads:
         t.start()
 
@@ -622,6 +660,9 @@ def cmd_doctor(args):
     if car.get("name"):
         loc = f" · {car['country']}" if car.get("country") else ""
         print(f"  carrier    {cyan(car['name'])}{loc}   {dim(car.get('ip', ''))}")
+    else:
+        # Silently dropping the line just looks like the feature is missing.
+        print(dim("  network    (couldn't identify — lookup blocked or offline)"))
     if wifi.get("rssi") is not None:
         word, wcol = signal_words(wifi.get("rssi"), wifi.get("snr"))
         band = f"{wifi['band']}GHz ch{wifi['channel']}" if wifi.get("band") else ""
@@ -644,6 +685,37 @@ def cmd_doctor(args):
     print()
 
     findings = []
+    try:
+        local_mtu = int(info["mtu"])
+    except (TypeError, ValueError):
+        local_mtu = None
+
+    # A leftover cap from a tethering session. `ifconfig` MTU is not reset by
+    # switching networks — only by the interface actually going down — so you
+    # can land on ordinary wifi still capped and never notice.
+    if local_mtu and local_mtu < 1500 and not is_hotspot(info):
+        findings.append((
+            "med",
+            f"Interface MTU is still {local_mtu} on a network that isn't a hotspot.",
+            f"Almost certainly left over from a tethering session — switching "
+            f"networks does not reset it. Harmless, but needlessly slow here. "
+            f"Restore it with `sudo ifconfig {info['iface']} mtu 1500`.",
+        ))
+
+    # Signal quality is about the Wi-Fi hop, which matters on any Wi-Fi network,
+    # not only a hotspot.
+    if wifi.get("rssi") is not None:
+        word, _ = signal_words(wifi.get("rssi"), wifi.get("snr"))
+        if word in ("weak", "very weak"):
+            near = ("the phone" if is_hotspot(info) else "the router")
+            findings.append((
+                "high",
+                f"Wi-Fi signal is {word} ({wifi['rssi']} dBm, SNR {wifi.get('snr','?')} dB).",
+                f"This is the hop you fix by moving, and it is upstream of "
+                f"everything else — get closer to {near}, or use a cable. Below "
+                f"about -75 dBm the link starts retransmitting heavily, which "
+                f"shows up as jitter rather than as lost packets.",
+            ))
 
     if is_hotspot(info) and not is_usb_tether(info):
         findings.append((
@@ -661,16 +733,6 @@ def cmd_doctor(args):
                 "If you must stay on Wi-Fi, turn on Maximize Compatibility.",
                 "iPhone → Settings → Personal Hotspot → Maximize Compatibility. "
                 "Forces 2.4 GHz: lower ceiling, much better range and stability.",
-            ))
-
-        word, _ = signal_words(wifi.get("rssi"), wifi.get("snr"))
-        if word in ("weak", "very weak"):
-            findings.append((
-                "high",
-                f"Wi-Fi signal to the phone is {word} ({wifi['rssi']} dBm).",
-                "This is the hop you fix by moving the laptop, not the phone. Get "
-                "them within a couple of metres of each other, or use the USB "
-                "cable and remove the hop entirely.",
             ))
 
     if is_hotspot(info):
@@ -725,10 +787,6 @@ def cmd_doctor(args):
 
     if dns_ok:
         mtu, mkind = probe_mtu()
-        try:
-            local_mtu = int(info["mtu"])
-        except (TypeError, ValueError):
-            local_mtu = None
         # Only a finding while the interface is still oversized. Once it has
         # been lowered to match, there is nothing left to report.
         if mkind == "reduced" and mtu and (local_mtu is None or local_mtu > mtu):
