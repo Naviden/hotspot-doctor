@@ -12,6 +12,7 @@ you're reading this on a connection that can't be trusted to download anything.
   hotspot calm         suspend background bandwidth hogs (reversible)
   hotspot restore      resume everything `calm` suspended
   hotspot keepalive    quiet keep-alive only, safe to background
+  hotspot mtu          find the real path MTU (why big transfers stall)
   hotspot dns fast     point DNS at 1.1.1.1 (carrier DNS is often the stall)
   hotspot dns auto     hand DNS back to DHCP
 """
@@ -45,13 +46,17 @@ yellow = lambda s: c("33", s)
 cyan = lambda s: c("36", s)
 
 
-def run(cmd, timeout=6):
-    """Run a command, return stdout ('' on any failure). Never raises."""
+def run(cmd, timeout=6, merge=False):
+    """Run a command, return stdout ('' on any failure). Never raises.
+
+    merge=True also folds in stderr, which `ping` uses for the errors that
+    matter to MTU probing ('Message too long').
+    """
     try:
         p = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False
         )
-        return p.stdout
+        return p.stdout + p.stderr if merge else p.stdout
     except (subprocess.SubprocessError, OSError):
         return ""
 
@@ -196,7 +201,93 @@ def verdict(t):
     return "GOOD", green
 
 
-def diagnose(gw, net, info):
+# ── path MTU ─────────────────────────────────────────────────────────────────
+# The failure this catches: pings are tiny, so a link whose large packets are
+# being silently dropped still measures as perfectly healthy. Meanwhile every
+# real transfer stalls — SSH hangs mid-session, pages half-load, git clone
+# freezes at 99%. Cellular paths very often carry less than the 1500 bytes the
+# interface claims, and nothing on the machine tells you.
+IP_ICMP_OVERHEAD = 28  # 20-byte IPv4 header + 8-byte ICMP header
+FULL_PAYLOAD = 1500 - IP_ICMP_OVERHEAD  # 1472
+
+
+def df_ping(host, payload, timeout_ms=1200):
+    """One don't-fragment ping. Returns (kind, mtu_hint).
+
+    kind: 'ok' | 'frag' (router told us the limit) | 'toobig' (local NIC
+    refused it) | 'lost' (silent drop — the black hole case).
+    """
+    out = run(["ping", "-D", "-n", "-c", "1", "-W", str(timeout_ms),
+               "-s", str(payload), host],
+              timeout=timeout_ms / 1000.0 + 2, merge=True)
+    if "time=" in out:
+        return "ok", None
+    low = out.lower()
+    if "message too long" in low:
+        return "toobig", None
+    m = re.search(r"mtu\s*=\s*(\d+)", low)
+    if m:
+        return "frag", int(m.group(1))
+    return "lost", None
+
+
+def mtu_capped(host=INTERNET, timeout_ms=1200):
+    """Cheap yes/no: does a full-size packet get through? None if unknown.
+
+    Two probes, not one — a single loss on a flaky link would otherwise read
+    as an MTU cap. Used by `watch`, which can't afford the full search.
+    """
+    for _ in range(2):
+        kind, _hint = df_ping(host, FULL_PAYLOAD, timeout_ms)
+        if kind == "ok":
+            return False
+        if kind == "toobig":
+            return True
+    return True if kind == "lost" else None
+
+
+def probe_mtu(host=INTERNET, timeout_ms=1200):
+    """Find the real path MTU. Returns (mtu, kind).
+
+    kind: 'ok' (full 1500 passes) | 'reduced' (mtu is real and below 1500)
+          | 'down' (small pings fail too, so this isn't an MTU question)
+          | 'unknown'
+    """
+    # Guard first: on a dead link every probe fails, and reporting that as an
+    # MTU black hole would be confidently wrong.
+    if not any(df_ping(host, 56, timeout_ms)[0] == "ok" for _ in range(3)):
+        return None, "down"
+
+    kind, hint = df_ping(host, FULL_PAYLOAD, timeout_ms)
+    if kind == "ok":
+        return 1500, "ok"
+    if kind == "frag" and hint:
+        return hint, ("ok" if hint >= 1500 else "reduced")
+
+    # Silent drop. Nothing will tell us the limit, so bisect for it.
+    lo, hi = 56, FULL_PAYLOAD  # lo known good, hi known bad
+    # One probe at the IPv6 floor usually lifts the lower bound straight to
+    # 1252 and saves ~4 rounds of slow timeouts. Falls back cleanly if the
+    # path really is smaller than that.
+    if df_ping(host, 1280 - IP_ICMP_OVERHEAD, timeout_ms)[0] == "ok":
+        lo = 1280 - IP_ICMP_OVERHEAD
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        k, h = df_ping(host, mid, timeout_ms)
+        if k == "frag" and h:
+            return h, ("ok" if h >= 1500 else "reduced")
+        if k == "ok":
+            lo = mid
+        elif k == "toobig":
+            hi = mid
+        else:
+            # A lone drop may just be ordinary loss. Make it prove itself.
+            k2, _ = df_ping(host, mid, timeout_ms)
+            lo, hi = (mid, hi) if k2 == "ok" else (lo, mid)
+    return lo + IP_ICMP_OVERHEAD, "reduced"
+
+
+def diagnose(gw, net, info, mtu_bad=None):
     """The useful bit: is it the Wi-Fi hop to the phone, or the cellular side?"""
     if not gw.samples or not net.samples:
         return None
@@ -204,6 +295,12 @@ def diagnose(gw, net, info):
     net_ok = not net.dead and net.loss <= 10
 
     if gw_ok and net_ok:
+        # Pings are small. A path that silently drops full-size packets still
+        # measures as perfect here, so say so rather than calling it healthy.
+        if mtu_bad:
+            return yellow("Latency is fine, but full-size packets are being "
+                          "dropped. ") + ("Large transfers will stall. Run "
+                                          "`hotspot mtu` to find the limit.")
         return green("Link healthy end to end.")
     if not gw_ok:
         fix = ("Move the Mac closer to the phone, or plug in the USB cable "
@@ -411,6 +508,19 @@ def cmd_doctor(_args):
                 "feels stuck'. Run `hotspot dns fast` to use 1.1.1.1.",
             ))
 
+    if dns_ok:
+        mtu, mkind = probe_mtu()
+        if mkind == "reduced" and mtu:
+            findings.append((
+                "high",
+                f"Path MTU is {mtu}, but the interface is set to {info['mtu']}.",
+                f"Packets larger than {mtu} bytes are being dropped silently — no "
+                f"error, no ICMP. Latency looks perfect while every large transfer "
+                f"stalls: SSH freezes mid-session, pages half-load, git hangs near "
+                f"the end. Run `sudo ifconfig {info['iface']} mtu {mtu}` to match "
+                f"the path. See `hotspot mtu`.",
+            ))
+
     print(bold("Findings"))
     order = {"high": 0, "med": 1, "low": 2}
     tag = {"high": red("●"), "med": yellow("●"), "low": dim("●")}
@@ -557,8 +667,16 @@ def cmd_watch(_args):
         finally:
             done.set()
 
+    def mtu_check():
+        # Deliberately not gated by `done`: on a capped link both probes time
+        # out, and making the monitor wait ~2.5s for that would be a worse
+        # trade than letting the verdict appear a moment after the first frame.
+        # Cheap two-probe check only — the full bisect belongs to `hotspot mtu`.
+        first["mtu_bad"] = mtu_capped(INTERNET)
+
     th = threading.Thread(target=warm, daemon=True)
     th.start()
+    threading.Thread(target=mtu_check, daemon=True).start()
     intro(done)
     th.join(timeout=8)
     if "gw" in first:
@@ -608,7 +726,7 @@ def cmd_watch(_args):
 
             lines.append(f"  {'traffic':<9} ↓ {human_rate(rin)}   ↑ {human_rate(rout)}")
             lines.append("")
-            d = diagnose(gw, net, info)
+            d = diagnose(gw, net, info, first.get("mtu_bad"))
             if d:
                 for line in wrap(re.sub(r"\033\[\d+m", "", d), 70):
                     lines.append(f"  {line}")
@@ -632,6 +750,58 @@ def cmd_watch(_args):
         if TTY:
             sys.stdout.write("\033[?25h\n")
             sys.stdout.flush()
+    return 0
+
+
+# ── mtu ──────────────────────────────────────────────────────────────────────
+def cmd_mtu(args):
+    info = link_info()
+    if not info["iface"]:
+        print(red("Offline — no default route."))
+        return 1
+    host = args[0] if args else INTERNET
+
+    print(f"{bold('hotspot mtu')}  probing {host} …")
+    mtu, kind = probe_mtu(host)
+    local = info.get("mtu")
+    try:
+        local = int(local)
+    except (TypeError, ValueError):
+        local = None
+    print()
+
+    if kind == "down":
+        print(red("  Can't probe — even small pings are failing."))
+        print(dim("  Fix the link first: `hotspot doctor`"))
+        return 1
+    if kind == "unknown" or not mtu:
+        print(yellow("  Inconclusive. Results weren't consistent enough to trust."))
+        return 1
+
+    iface = info["iface"]
+    print(f"  path MTU       {bold(str(mtu))}")
+    print(f"  interface MTU  {local if local else '?'}   ({iface})")
+    print()
+
+    if kind == "ok":
+        print(green("  Full-size packets get through. Nothing to fix."))
+        return 0
+
+    print(red(f"  Full-size packets are being dropped above {mtu} bytes."))
+    print()
+    for line in wrap(
+        "Your interface is set to " + str(local or "1500") + " but the path only "
+        "carries " + str(mtu) + ". macOS keeps sending packets that are too big "
+        "and they vanish with no error, so latency looks perfect while large "
+        "transfers stall — SSH freezes mid-session, pages half-load, git hangs "
+        "near the end. Lowering the interface to match makes the stalls stop.", 72):
+        print(f"  {line}")
+    print()
+    print(dim("  Fix (takes effect immediately, resets when you reconnect):"))
+    print(f"    sudo ifconfig {iface} mtu {mtu}")
+    print()
+    print(dim("  Undo:"))
+    print(f"    sudo ifconfig {iface} mtu {local or 1500}")
     return 0
 
 
@@ -661,6 +831,7 @@ COMMANDS = {
     "restore": cmd_restore,
     "keepalive": cmd_keepalive,
     "dns": cmd_dns,
+    "mtu": cmd_mtu,
 }
 
 

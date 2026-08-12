@@ -56,6 +56,29 @@ Walking your laptop toward the phone does nothing if the problem is cellular. Mo
 
 ---
 
+## The failure nobody checks for
+
+Ping packets are tiny. So a link that silently drops *full-size* packets still measures as flawless — 0% loss, low jitter, green across the board — while every real transfer stalls. SSH freezes mid-session. Pages load halfway. `git clone` hangs at 99%. Every tool tells you the connection is fine, because by the only thing they measure, it is.
+
+That's a path MTU black hole, and cellular links cause it constantly. The interface claims it can carry 1500 bytes; the path actually carries less; nothing on the machine tells you, because the oversized packets vanish with no error and no ICMP.
+
+```
+$ hotspot mtu
+  path MTU       1450
+  interface MTU  1500   (en0)
+
+  Full-size packets are being dropped above 1450 bytes.
+
+  Fix (takes effect immediately, resets when you reconnect):
+    sudo ifconfig en0 mtu 1450
+```
+
+`hotspot mtu` bisects for the real limit and hands you the one-line fix. `watch` runs a cheap two-probe version at startup, so it says *"latency is fine, but full-size packets are being dropped"* instead of *"healthy end to end"* — which is what the honest answer looks like when everything except the thing that matters is working.
+
+Two details that keep it from crying wolf: a small-ping baseline runs first, so a *dead* link is reported as dead rather than as an MTU problem, and every failing probe is confirmed a second time, so ordinary packet loss on a flaky link isn't mistaken for a size limit.
+
+---
+
 ## Install
 
 ```bash
@@ -80,6 +103,7 @@ Requires macOS and Python 3.8+ (both already on your system — Python 3 ships w
 | `hotspot watch` | Live latency / jitter / loss monitor, plus keep-alive. The main view. |
 | `hotspot doctor` | Diagnose the link and print concrete, ranked fixes |
 | `hotspot status` | One-shot snapshot, good for scripts |
+| `hotspot mtu` | Find the real path MTU — why big transfers stall while ping looks fine |
 | `hotspot calm` | Suspend background bandwidth hogs (**reversible**) |
 | `hotspot restore` | Resume everything `calm` suspended |
 | `hotspot keepalive [secs]` | Quiet keep-alive only, safe to background |
