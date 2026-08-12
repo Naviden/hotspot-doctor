@@ -9,6 +9,7 @@ you're reading this on a connection that can't be trusted to download anything.
   hotspot watch        live monitor + keep-alive
   hotspot status       one-shot snapshot
   hotspot doctor       diagnose the link, recommend concrete fixes
+                       (--no-speed skips the 2 MB throughput test)
   hotspot calm         suspend background bandwidth hogs (reversible)
   hotspot restore      resume everything `calm` suspended
   hotspot keepalive    quiet keep-alive only, safe to background
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 
 STATE = os.path.expanduser("~/.cache/hotspot-suspended")
@@ -174,19 +176,34 @@ class Track:
 
 
 BARS = "▁▂▃▄▅▆▇█"
-STEPS = (20, 40, 60, 90, 130, 200, 300)
+# Bars are drawn relative to each link's OWN baseline, not an absolute ms
+# scale. An absolute scale painted a rock-steady 100ms cellular link solid
+# red while the verdict said GOOD — the picture and the words disagreed, and
+# the picture is what people believe. What actually hurts is *deviation*:
+# a steady 100ms is fine, a 100ms link that spikes to 600ms is not.
+RATIOS = (1.3, 1.7, 2.2, 3.0, 4.0, 5.5, 7.5)
+BASELINE_FLOOR = 15.0  # ms; below this, small absolute wobbles aren't real
+ABS_BAD, ABS_ROUGH = 600.0, 300.0  # a spike this big is bad on any link
 
 
-def spark(samples, width):
+def spark(samples, width, baseline=None):
+    """Deviation from `baseline`, so calm links look calm at any latency."""
+    base = max(baseline or 0.0, BASELINE_FLOOR)
     out = []
     for s in list(samples)[-width:]:
         if s is None:
             out.append(red("×"))
             continue
-        level = sum(s > t for t in STEPS)
+        level = sum(s / base > r for r in RATIOS)
+        # Relative is the right lens, but don't let it excuse a genuinely
+        # awful absolute number just because the link is always awful.
+        if s > ABS_BAD:
+            level = max(level, 6)
+        elif s > ABS_ROUGH:
+            level = max(level, 4)
         ch = BARS[level]
-        out.append(green(ch) if level <= 2 else yellow(ch) if level <= 4 else red(ch))
-    return "".join(out).rjust(width + 0)
+        out.append(green(ch) if level <= 1 else yellow(ch) if level <= 3 else red(ch))
+    return "".join(out).rjust(width)
 
 
 # ── verdict + diagnosis ──────────────────────────────────────────────────────
@@ -199,6 +216,101 @@ def verdict(t):
     if t.loss > 5 or (med and med > 250) or (jit and jit > 80):
         return "ROUGH", yellow
     return "GOOD", green
+
+
+# ── who you're actually connected through ────────────────────────────────────
+def wifi_info():
+    """Signal, band and PHY for the current Wi-Fi link. No sudo needed.
+
+    This measures the hop to the phone — the half of the problem you can fix
+    by moving the laptop, as opposed to the half you fix by moving the phone.
+    """
+    out = run(["system_profiler", "SPAirPortDataType"], timeout=15)
+    _, _, rest = out.partition("Current Network Information:")
+    if not rest:
+        return {}
+    blk, d = rest[:900], {}
+    m = re.search(r"Signal\s*/\s*Noise:\s*(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm", blk)
+    if m:
+        d["rssi"], d["noise"] = int(m.group(1)), int(m.group(2))
+        d["snr"] = d["rssi"] - d["noise"]
+    m = re.search(r"PHY Mode:\s*(\S+)", blk)
+    if m:
+        d["phy"] = m.group(1)
+    m = re.search(r"Channel:\s*(\d+)\s*\((\d+)GHz", blk)
+    if m:
+        d["channel"], d["band"] = int(m.group(1)), int(m.group(2))
+    m = re.search(r"Transmit Rate:\s*(\d+)", blk)
+    if m:
+        d["txrate"] = int(m.group(1))
+    return d
+
+
+def carrier_info():
+    """Which network you're actually egressing through, via DNS + whois.
+
+    Deliberately not an HTTP geolocation API: one DNS query plus one whois is
+    a few KB, needs no key, and sends nothing but the lookup itself.
+    """
+    ip = run(["dig", "+short", "+time=3", "+tries=1",
+              "myip.opendns.com", "@resolver1.opendns.com"], timeout=10)
+    ip = ip.strip().split("\n")[0].strip()
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+        return {}
+    d = {"ip": ip}
+    w = run(["whois", ip], timeout=15)
+    for pat, key in ((r"^org-?name:\s*(.+)$", "org"),
+                     (r"^organization:\s*(.+)$", "org"),
+                     (r"^netname:\s*(.+)$", "netname"),
+                     (r"^descr:\s*(.+)$", "descr"),
+                     (r"^country:\s*(.+)$", "country")):
+        m = re.search(pat, w, re.I | re.M)
+        if m and key not in d:
+            d[key] = m.group(1).strip()
+    name = d.get("org") or ""
+    if not name and d.get("netname"):
+        # FASTWEB-MBB -> Fastweb. Crude, but right far more often than not.
+        name = d["netname"].split("-")[0].title()
+    d["name"] = name or d.get("descr", "")[:40] or "unknown"
+    return d
+
+
+def speed_test(max_bytes=2_000_000, max_secs=6.0):
+    """Bounded download. Returns (mbps, bytes, secs) or None.
+
+    Capped on bytes AND seconds, because this spends the exact resource the
+    rest of the tool exists to conserve. On a slow link the clock stops it
+    early and the answer is still directionally right.
+    """
+    url = f"https://speed.cloudflare.com/__down?bytes={max_bytes}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "hotspot-doctor"})
+        n, t0 = 0, time.time()
+        with urllib.request.urlopen(req, timeout=max_secs + 5) as r:
+            while time.time() - t0 < max_secs:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                n += len(chunk)
+        dt = time.time() - t0
+        if dt <= 0 or n < 50_000:
+            return None
+        return n * 8 / dt / 1e6, n, dt
+    except Exception:
+        return None
+
+
+def signal_words(rssi, snr):
+    """Plain words for a dBm number nobody should have to interpret."""
+    if rssi is None:
+        return "", None
+    if rssi >= -60 and (snr or 99) >= 25:
+        return "excellent", green
+    if rssi >= -70:
+        return "good", green
+    if rssi >= -78:
+        return "weak", yellow
+    return "very weak", red
 
 
 # ── path MTU ─────────────────────────────────────────────────────────────────
@@ -287,31 +399,67 @@ def probe_mtu(host=INTERNET, timeout_ms=1200):
     return lo + IP_ICMP_OVERHEAD, "reduced"
 
 
-def diagnose(gw, net, info, mtu_bad=None):
-    """The useful bit: is it the Wi-Fi hop to the phone, or the cellular side?"""
+def diagnose(gw, net, info, mtu_bad=None, busy=False, paused=0):
+    """What is wrong, and what to do about it.
+
+    Returns (colour, headline, [actions]). Every branch ends in something the
+    reader can actually do — the old version handed back measurements and left
+    the interpreting to them, which is the part they were stuck on.
+    """
     if not gw.samples or not net.samples:
         return None
     gw_ok = not gw.dead and gw.loss <= 10
     net_ok = not net.dead and net.loss <= 10
 
-    if gw_ok and net_ok:
-        # Pings are small. A path that silently drops full-size packets still
-        # measures as perfect here, so say so rather than calling it healthy.
-        if mtu_bad:
-            return yellow("Latency is fine, but full-size packets are being "
-                          "dropped. ") + ("Large transfers will stall. Run "
-                                          "`hotspot mtu` to find the limit.")
-        return green("Link healthy end to end.")
+    if gw.dead and net.dead:
+        return red, "Link is down.", [
+            "check Personal Hotspot is still enabled on the phone",
+            "toggle Wi-Fi off and on",
+        ]
+
     if not gw_ok:
-        fix = ("Move the Mac closer to the phone, or plug in the USB cable "
-               "(`hotspot doctor`).")
         if is_usb_tether(info):
-            fix = "USB tether is dropping — reseat the cable, try another port."
-        return red("Problem is the hop to your phone, not the cellular side. ") + fix
-    return red("Phone link is fine — the cellular side is dropping. ") + (
-        "Move the phone toward a window and force LTE: Settings → Cellular → "
-        "Cellular Data Options → Voice & Data → LTE."
-    )
+            return red, "The USB tether itself is dropping.", [
+                "reseat the cable, then try a different port",
+            ]
+        return red, "The Wi-Fi hop to your phone is the problem, not cellular.", [
+            "move the Mac closer to the phone",
+            "or plug in the USB cable — removes this hop entirely",
+        ]
+
+    if not net_ok:
+        return red, "Your phone link is fine — the cellular side is dropping.", [
+            "move the phone toward a window",
+            "force LTE: Settings → Cellular → Cellular Data Options → Voice & Data",
+        ]
+
+    # Everything passes the loss test. Now the things that still ruin the day.
+    jit = net.jitter or 0
+    if jit > 50:
+        acts = ["expect SSH and calls to stutter; large pages will feel slow"]
+        if not paused:
+            acts.append("hotspot calm — pause background sync, which makes jitter worse")
+        acts.append("move the phone toward a window")
+        return yellow, f"Latency is OK but unstable ({jit:.0f}ms jitter).", acts
+
+    if mtu_bad:
+        # Pings are small, so a path dropping full-size packets measures as
+        # perfect here. Say that plainly rather than calling it healthy.
+        return yellow, "Latency is fine, but full-size packets are being dropped.", [
+            "large transfers will stall — SSH freezes, git hangs near the end",
+            "hotspot mtu — find the limit and get the one-line fix",
+        ]
+
+    if busy and not paused:
+        return yellow, "Link is fine, but something is using a lot of it.", [
+            "hotspot calm — pause background sync",
+        ]
+
+    if paused:
+        return green, "Link is stable. Nothing to do.", [
+            f"{paused} process(es) still paused — hotspot restore when back on wifi",
+        ]
+    return green, "Link is stable. Nothing to do.", []
 
 
 # ── calm / restore ───────────────────────────────────────────────────────────
@@ -427,7 +575,8 @@ def cmd_dns(args):
 
 
 # ── doctor ───────────────────────────────────────────────────────────────────
-def cmd_doctor(_args):
+def cmd_doctor(args):
+    no_speed = "--no-speed" in (args or [])
     info = link_info()
     print(bold("Link"))
     if not info["iface"]:
@@ -436,9 +585,45 @@ def cmd_doctor(_args):
     label = info["port"] or info["iface"]
     if info["ssid"]:
         label += f" · {info['ssid']}"
+
+    # Both are passive and slow-ish (system_profiler and whois each take a few
+    # seconds). Overlap them so the header costs one wait, not two.
+    box = {}
+    threads = [threading.Thread(target=lambda: box.update(wifi=wifi_info()), daemon=True),
+               threading.Thread(target=lambda: box.update(car=carrier_info()), daemon=True)]
+    for t in threads:
+        t.start()
+
     print(f"  interface  {cyan(info['iface'])}  ({label})")
     print(f"  gateway    {info['gateway']}")
     print(f"  mtu        {info['mtu']}")
+
+    for t in threads:
+        t.join(timeout=20)
+    wifi, car = box.get("wifi") or {}, box.get("car") or {}
+
+    if car.get("name"):
+        loc = f" · {car['country']}" if car.get("country") else ""
+        print(f"  carrier    {cyan(car['name'])}{loc}   {dim(car.get('ip', ''))}")
+    if wifi.get("rssi") is not None:
+        word, wcol = signal_words(wifi.get("rssi"), wifi.get("snr"))
+        band = f"{wifi['band']}GHz ch{wifi['channel']}" if wifi.get("band") else ""
+        extra = " · ".join(x for x in (wifi.get("phy"), band) if x)
+        detail = dim(f"{wifi['rssi']} dBm · SNR {wifi.get('snr', '?')} dB")
+        print(f"  wi-fi      {wcol(word)}  {detail}   {dim(extra)}")
+
+    speed = None
+    if not no_speed:
+        if TTY:  # \r only overwrites on a terminal; piped it would just linger
+            print(dim("  speed      measuring…"), end="\r", flush=True)
+        speed = speed_test()
+        pad = "      " if TTY else ""
+        if speed:
+            mbps, nbytes, secs = speed
+            print(f"  speed      {bold(f'{mbps:.1f} Mbps')} down"
+                  f"   {dim(f'{nbytes/1e6:.1f} MB in {secs:.1f}s')}{pad}")
+        else:
+            print(dim(f"  speed      couldn't measure{pad}"))
     print()
 
     findings = []
@@ -451,12 +636,25 @@ def cmd_doctor(_args):
             "Wi-Fi hop entirely — no interference, no hotspot sleep, lower latency, "
             "and the phone charges. This is the single biggest win available to you.",
         ))
-        findings.append((
-            "med",
-            "If you must stay on Wi-Fi, turn on Maximize Compatibility.",
-            "iPhone → Settings → Personal Hotspot → Maximize Compatibility. Forces "
-            "2.4 GHz: lower ceiling, much better range and stability.",
-        ))
+        # Already on 2.4GHz means Maximize Compatibility is on. Telling someone
+        # to do a thing they have already done costs the tool its credibility.
+        if wifi.get("band") != 2:
+            findings.append((
+                "med",
+                "If you must stay on Wi-Fi, turn on Maximize Compatibility.",
+                "iPhone → Settings → Personal Hotspot → Maximize Compatibility. "
+                "Forces 2.4 GHz: lower ceiling, much better range and stability.",
+            ))
+
+        word, _ = signal_words(wifi.get("rssi"), wifi.get("snr"))
+        if word in ("weak", "very weak"):
+            findings.append((
+                "high",
+                f"Wi-Fi signal to the phone is {word} ({wifi['rssi']} dBm).",
+                "This is the hop you fix by moving the laptop, not the phone. Get "
+                "them within a couple of metres of each other, or use the USB "
+                "cable and remove the hop entirely.",
+            ))
 
     if is_hotspot(info):
         findings.append((
@@ -510,7 +708,13 @@ def cmd_doctor(_args):
 
     if dns_ok:
         mtu, mkind = probe_mtu()
-        if mkind == "reduced" and mtu:
+        try:
+            local_mtu = int(info["mtu"])
+        except (TypeError, ValueError):
+            local_mtu = None
+        # Only a finding while the interface is still oversized. Once it has
+        # been lowered to match, there is nothing left to report.
+        if mkind == "reduced" and mtu and (local_mtu is None or local_mtu > mtu):
             findings.append((
                 "high",
                 f"Path MTU is {mtu}, but the interface is set to {info['mtu']}.",
@@ -567,11 +771,15 @@ def cmd_status(_args):
         v, col = verdict(t)
         med = f"{t.median:.0f} ms" if t.median else "—"
         print(f"  {t.name:<9} {col(v):<16} {med:>8}  loss {t.loss:.0f}%")
-    d = diagnose(gw, net, info)
+    d = diagnose(gw, net, info, paused=suspended_count())
     if d:
+        col, head, acts = d
         print()
-        for line in wrap(re.sub(r"\033\[\d+m", "", d), 74):
-            print(f"  {line}")
+        for line in wrap(head, 74):
+            print(f"  {col(line)}")
+        for a in acts:
+            for i, line in enumerate(wrap(a, 70)):
+                print(dim(f"    {'→' if i == 0 else ' '} {line}"))
     return 0
 
 
@@ -716,7 +924,8 @@ def cmd_watch(_args):
                 med = f"{t.median:.0f}ms" if t.median else "—"
                 jit = f"{t.jitter:.0f}ms" if t.jitter else "—"
                 lines.append(
-                    f"  {t.name:<9} {spark(t.samples, width)}  {col(v.ljust(5))}"
+                    f"  {t.name:<9} {spark(t.samples, width, t.median)}  "
+                    f"{col(v.ljust(5))}"
                 )
                 lines.append(
                     dim(f"  {'':<9} median {med:>7}   jitter {jit:>7}   "
@@ -726,10 +935,15 @@ def cmd_watch(_args):
 
             lines.append(f"  {'traffic':<9} ↓ {human_rate(rin)}   ↑ {human_rate(rout)}")
             lines.append("")
-            d = diagnose(gw, net, info, first.get("mtu_bad"))
+            d = diagnose(gw, net, info, first.get("mtu_bad"),
+                         busy=(rin + rout) > 400_000, paused=susp)
             if d:
-                for line in wrap(re.sub(r"\033\[\d+m", "", d), 70):
-                    lines.append(f"  {line}")
+                col, head, acts = d
+                for line in wrap(head, 68):
+                    lines.append("  " + col(line))
+                for a in acts:
+                    for i, line in enumerate(wrap(a, 64)):
+                        lines.append(dim(f"    {'→' if i == 0 else ' '} {line}"))
             lines.append("")
             lines.append(dim(f"  keep-alive active · {int(time.time() - started)}s · ctrl-c to stop"))
 
@@ -779,29 +993,66 @@ def cmd_mtu(args):
         return 1
 
     iface = info["iface"]
-    print(f"  path MTU       {bold(str(mtu))}")
-    print(f"  interface MTU  {local if local else '?'}   ({iface})")
+    for line in wrap(
+            "Path MTU is the largest packet that survives the whole route. "
+            "Anything bigger is dropped silently — no error, no warning — which "
+            "is why transfers stall while ping stays perfect. The fix is to stop "
+            "macOS sending packets bigger than the path accepts.", 72):
+        print(dim(f"  {line}"))
+    print()
+    print(f"  path MTU       {bold(str(mtu))}   {dim('what the route accepts')}")
+    print(f"  interface MTU  {local if local else '?'}   "
+          f"{dim(f'what {iface} is sending')}")
     print()
 
-    if kind == "ok":
-        print(green("  Full-size packets get through. Nothing to fix."))
+    if kind == "ok" and (local or 1500) >= 1500:
+        print(green("  Nothing to fix. Full-size packets get through."))
         return 0
 
-    print(red(f"  Full-size packets are being dropped above {mtu} bytes."))
+    # Already lowered to match: this is the *fixed* state, not a fault. Saying
+    # "1500 but the path only carries 1500" and offering a fix identical to the
+    # undo is how the previous version read here.
+    if local and local <= mtu:
+        if local == mtu:
+            print(green("  Matched — nothing is being dropped."))
+            print(dim("  Your interface is already at the path limit. This is "
+                      "the working state."))
+        else:
+            print(green("  Nothing is being dropped."))
+            for line in wrap(f"Your interface ({local}) is below the path limit "
+                             f"({mtu}) — safe, just slightly smaller packets "
+                             f"than necessary.", 72):
+                print(dim(f"  {line}"))
+        print()
+        print(yellow("  This does not persist."))
+        for line in wrap(
+                f"`ifconfig` MTU is reset whenever {iface} reconnects, so you "
+                f"will need to set it again on each new hotspot session. Back on "
+                f"real wifi you want the full 1500 — a {local} cap there is "
+                f"harmless but pointlessly slower.", 72):
+            print(f"  {line}")
+        print()
+        print(dim("  Back on real wifi:"))
+        print(f"    sudo ifconfig {iface} mtu 1500")
+        return 0
+
+    print(red(f"  Mismatch — packets between {mtu + 1} and {local or 1500} bytes "
+              f"are vanishing."))
     print()
     for line in wrap(
-        "Your interface is set to " + str(local or "1500") + " but the path only "
-        "carries " + str(mtu) + ". macOS keeps sending packets that are too big "
-        "and they vanish with no error, so latency looks perfect while large "
-        "transfers stall — SSH freezes mid-session, pages half-load, git hangs "
-        "near the end. Lowering the interface to match makes the stalls stop.", 72):
+            f"{iface} is sending up to {local or 1500} bytes but the route only "
+            f"carries {mtu}. The oversized ones disappear with no error, so "
+            f"latency looks perfect while large transfers stall — SSH freezes "
+            f"mid-session, pages half-load, git hangs near the end.", 72):
         print(f"  {line}")
     print()
-    print(dim("  Fix (takes effect immediately, resets when you reconnect):"))
+    print(dim("  Fix:"))
     print(f"    sudo ifconfig {iface} mtu {mtu}")
     print()
-    print(dim("  Undo:"))
-    print(f"    sudo ifconfig {iface} mtu {local or 1500}")
+    for line in wrap(f"Resets when {iface} reconnects, so re-run it each hotspot "
+                     f"session. On real wifi, put it back:", 72):
+        print(dim(f"  {line}"))
+    print(dim(f"    sudo ifconfig {iface} mtu 1500"))
     return 0
 
 

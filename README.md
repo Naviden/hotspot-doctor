@@ -56,6 +56,30 @@ Walking your laptop toward the phone does nothing if the problem is cellular. Mo
 
 ---
 
+## What `doctor` tells you
+
+```
+Link
+  interface  en0  (Wi-Fi)
+  gateway    172.20.10.1
+  mtu        1450
+  carrier    Fastweb · IT   93.44.41.162
+  wi-fi      excellent  -58 dBm · SNR 39 dB   802.11ax · 2GHz ch6
+  speed      19.7 Mbps down   2.0 MB in 0.8s
+```
+
+Who you're actually egressing through (often not the brand on the SIM — an MVNO rides someone else's network), how good the hop to the phone is in words rather than dBm, and what the link is currently worth in Mbps. Then a ranked list of findings, each with the exact fix.
+
+It only tells you things that are still true: recommendations you've already applied are suppressed, so if your Wi-Fi is already on 2.4 GHz it won't tell you to enable Maximize Compatibility, and once you've lowered the interface MTU to match the path it stops mentioning MTU.
+
+Three notes on cost and privacy, since this is the one command that reaches outside your machine:
+
+- The carrier lookup is **one DNS query and one whois** — a few KB, no API key, no HTTP geolocation service.
+- The speed test downloads **at most 2 MB, capped at 6 seconds**, from Cloudflare. On a metered tether that is not nothing, so `hotspot doctor --no-speed` skips it.
+- Everything else in the tool is entirely local.
+
+---
+
 ## The failure nobody checks for
 
 Ping packets are tiny. So a link that silently drops *full-size* packets still measures as flawless — 0% loss, low jitter, green across the board — while every real transfer stalls. SSH freezes mid-session. Pages load halfway. `git clone` hangs at 99%. Every tool tells you the connection is fine, because by the only thing they measure, it is.
@@ -64,14 +88,20 @@ That's a path MTU black hole, and cellular links cause it constantly. The interf
 
 ```
 $ hotspot mtu
-  path MTU       1450
-  interface MTU  1500   (en0)
+  path MTU       1450   what the route accepts
+  interface MTU  1500   what en0 is sending
 
-  Full-size packets are being dropped above 1450 bytes.
+  Mismatch — packets between 1451 and 1500 bytes are vanishing.
 
-  Fix (takes effect immediately, resets when you reconnect):
+  Fix:
     sudo ifconfig en0 mtu 1450
+
+  Resets when en0 reconnects, so re-run it each hotspot session.
+  On real wifi, put it back:
+    sudo ifconfig en0 mtu 1500
 ```
+
+The change is not permanent — `ifconfig` MTU is cleared whenever the interface reconnects, so you set it per hotspot session and restore 1500 on real wifi. Run `hotspot mtu` again any time and it reports which of those states you're in rather than repeating the same advice.
 
 `hotspot mtu` bisects for the real limit and hands you the one-line fix. `watch` runs a cheap two-probe version at startup, so it says *"latency is fine, but full-size packets are being dropped"* instead of *"healthy end to end"* — which is what the honest answer looks like when everything except the thing that matters is working.
 
@@ -135,7 +165,8 @@ hotspot restore
 ## Reading the monitor
 
 - **Two rows, two questions.** `phone` is the Wi-Fi hop to the iPhone. `internet` is the whole path, cellular included.
-- **Sparkline** scrolls right, one sample per second, ~46 seconds of history. Bar height is latency; green is fast, yellow mid, red slow. A red `×` is a dropped packet.
+- **Sparkline** scrolls right, one sample per second, ~46 seconds of history. Bars show how far each ping strayed from *that link's own baseline*, not absolute milliseconds — a steady 100 ms cellular link draws a calm flat green line, because steady is what it feels like. Spikes stick up and turn yellow, then red. A red `×` is a dropped packet.
+- **You should not have to interpret it.** Under the graph is a plain-language verdict and, when something is wrong, the specific thing to do about it.
 - **Verdict:** `GOOD` → `ROUGH` → `BAD` → `DOWN`.
 - **Jitter is the number that matters.** High jitter with a low median is what makes a link *feel* broken while speed tests look fine — it's what kills SSH, hot reload, and calls.
 - **traffic** shows live throughput. If you're idle and it reads megabits, something is syncing behind your back. Run `hotspot calm`.
